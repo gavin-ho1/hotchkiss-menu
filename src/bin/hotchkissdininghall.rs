@@ -25,6 +25,7 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Widget, Wrap,
     },
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -65,7 +66,10 @@ struct App {
     keys: Vec<WeekKey>,
     focus: Focus,
     show_all: bool,
+    diet: DietFilter,
     details: bool,
+    /// Station families whose cards show the opposite of `details` (clicked).
+    flipped: HashSet<String>,
     scroll: u16,
     view_h: u16,
     pending: usize,
@@ -77,6 +81,10 @@ struct App {
     list_offset: usize,
     list_rows: Vec<Option<usize>>,
     menu_area: Rect,
+    body_area: Rect,
+    /// Card and "+N more stations" note rects, in scrolled-canvas coordinates.
+    card_hits: Vec<(Rect, String)>,
+    note_hit: Option<Rect>,
     help_hits: Vec<(Rect, KeyCode)>,
     tx:mpsc::Sender<(WeekKey, Result<Week, String>)>,
     rx: mpsc::Receiver<(WeekKey, Result<Week, String>)>,
@@ -104,6 +112,13 @@ fn main() {
     let mut app = App::new(Arc::new(cfg));
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // ratatui's hook restores the screen on a crash; also release the mouse,
+    // or the terminal keeps printing escape codes for every click.
+    let restore = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        restore(info);
+    }));
     let res = app.run(&mut terminal);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
@@ -116,38 +131,73 @@ fn main() {
 impl App {
     fn new(cfg: Arc<Config>) -> App {
         let today = cfg.now().date_naive();
-        let dates: Vec<NaiveDate> = (0..=cfg.lookahead_days as u64).map(|i| today + Days::new(i)).collect();
-        let slots = dates
-            .iter()
-            .flat_map(|&date| cfg.meals_on(date).iter().map(move |m| Slot { date, meal: m.clone() }))
-            .collect();
-        let keys = keys_for(dates.iter().copied(), &cfg.all_menu_types());
-
-        // Everything cached is shown immediately; stale or missing weeks are refetched.
-        let mut menus = Menus::default();
-        let mut stale = Vec::new();
-        for k in &keys {
-            match read_cache(&cfg, k) {
-                Some((w, age)) => {
-                    menus.insert(k.clone(), w);
-                    if age >= cfg.cache_ttl {
-                        stale.push(k.clone());
-                    }
-                }
-                None => stale.push(k.clone()),
-            }
-        }
-
         let (tx, rx) = mpsc::channel();
         let mut app = App {
-            cfg, today, slots, sel: 0, user_moved: false, menus, keys, focus: Focus::List,
-            show_all: false, details: true, scroll: 0, view_h: 0, pending: 0, errors: Vec::new(),
-            show_config: false, quit: false, list_area: Rect::default(), list_offset: 0, list_rows: Vec::new(),
-            menu_area: Rect::default(), help_hits: Vec::new(), tx, rx,
+            cfg, today, slots: Vec::new(), sel: 0, user_moved: false, menus: Menus::default(), keys: Vec::new(),
+            focus: Focus::List, show_all: false, diet: DietFilter::All, details: true, flipped: HashSet::new(),
+            scroll: 0, view_h: 0, pending: 0, errors: Vec::new(), show_config: false, quit: false,
+            list_area: Rect::default(), list_offset: 0, list_rows: Vec::new(), menu_area: Rect::default(),
+            body_area: Rect::default(), card_hits: Vec::new(), note_hit: None, help_hits: Vec::new(), tx, rx,
         };
-        app.sel = app.next_meal();
-        app.fetch(stale);
+        app.set_today(today);
         app
+    }
+
+    /// (Re)build the meal list starting at `today`. Called at startup and
+    /// when the date rolls over with the app left open. Weeks not loaded yet
+    /// are shown from the cache immediately; stale or missing ones are fetched.
+    fn set_today(&mut self, today: NaiveDate) {
+        let cur = self.slots.get(self.sel).map(|s| (s.date, s.meal.label.clone()));
+        let dates: Vec<NaiveDate> = (0..=self.cfg.lookahead_days as u64).map(|i| today + Days::new(i)).collect();
+        self.slots = dates
+            .iter()
+            .flat_map(|&date| self.cfg.meals_on(date).iter().map(move |m| Slot { date, meal: m.clone() }))
+            .collect();
+        self.keys = keys_for(dates.iter().copied(), &self.cfg.all_menu_types());
+        self.today = today;
+
+        let mut stale = Vec::new();
+        let new: Vec<WeekKey> = self.keys.iter().filter(|k| !self.menus.has(k)).cloned().collect();
+        for k in new {
+            match read_cache(&self.cfg, &k) {
+                Some((w, age)) => {
+                    if age >= self.cfg.cache_ttl {
+                        stale.push(k.clone());
+                    }
+                    self.menus.insert(k, w);
+                }
+                None => stale.push(k),
+            }
+        }
+        self.fetch(stale);
+
+        // Keep a meal the user picked if it's still listed.
+        let kept = cur.filter(|_| self.user_moved).and_then(|(d, label)| {
+            self.slots.iter().position(|s| s.date == d && s.meal.label == label)
+        });
+        match kept {
+            Some(i) => self.sel = i,
+            None => {
+                self.user_moved = false;
+                self.sel = self.next_meal();
+                self.scroll = 0;
+            }
+        }
+    }
+
+    /// Runs every loop: follow the clock unless the user has picked a meal.
+    fn tick(&mut self) {
+        let today = self.cfg.now().date_naive();
+        if today != self.today {
+            self.set_today(today);
+        }
+        if !self.user_moved {
+            let next = self.next_meal();
+            if next != self.sel {
+                self.sel = next;
+                self.scroll = 0;
+            }
+        }
     }
 
     fn fetch(&mut self, keys: Vec<WeekKey>) {
@@ -178,10 +228,8 @@ impl App {
                     Err(e) if !self.errors.contains(&e) => self.errors.push(e),
                     Err(_) => {}
                 }
-                if self.pending == 0 && !self.user_moved {
-                    self.sel = self.next_meal();
-                }
             }
+            self.tick();
         }
         Ok(())
     }
@@ -291,7 +339,18 @@ impl App {
                 self.show_all = !self.show_all;
                 self.scroll = 0;
             }
-            KeyCode::Char('i') => self.details = !self.details,
+            KeyCode::Char('i') => {
+                self.details = !self.details;
+                self.flipped.clear();
+            }
+            KeyCode::Char('v') => {
+                self.diet = match self.diet {
+                    DietFilter::All => DietFilter::Vegetarian,
+                    DietFilter::Vegetarian => DietFilter::Vegan,
+                    DietFilter::Vegan => DietFilter::All,
+                };
+                self.scroll = 0;
+            }
             KeyCode::Char('r') if self.pending == 0 => {
                 self.errors.clear();
                 self.fetch(self.keys.clone());
@@ -321,7 +380,22 @@ impl App {
                 }
                 self.focus = Focus::List;
             }
-            MouseEventKind::Down(MouseButton::Left) if in_menu => self.focus = Focus::Menu,
+            MouseEventKind::Down(MouseButton::Left) if in_menu => {
+                self.focus = Focus::Menu;
+                let b = self.body_area;
+                if !b.contains(pos) {
+                    return;
+                }
+                let c = Position::new(m.column - b.x, m.row - b.y + self.scroll);
+                if self.note_hit.is_some_and(|r| r.contains(c)) {
+                    self.show_all = !self.show_all;
+                    self.scroll = 0;
+                } else if let Some((_, fam)) = self.card_hits.iter().find(|(r, _)| r.contains(c))
+                    && !self.flipped.remove(fam)
+                {
+                    self.flipped.insert(fam.clone());
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(&(_, code)) = self.help_hits.iter().find(|(r, _)| r.contains(pos)) {
                     self.key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -370,14 +444,20 @@ impl App {
     fn draw_help(&mut self, f: &mut Frame, area: Rect) {
         let all = if self.show_all { "main only" } else { "all stations" };
         let info = if self.details { "hide details" } else { "details" };
+        let diet = match self.diet {
+            DietFilter::All => "diet: all",
+            DietFilter::Vegetarian => "diet: V",
+            DietFilter::Vegan => "diet: VG",
+        };
         let ch = |c| Some(KeyCode::Char(c));
         // The key code, if any, is what clicking the entry sends.
         let keys: Vec<(&str, &str, Option<KeyCode>)> = match self.focus {
             Focus::List => vec![("j/k", "meal", None), ("l", "open", ch('l')), ("[ ]", "day", None),
-                                ("n", "next meal", ch('n')), ("a", all, ch('a')), ("i", info, ch('i')),
+                                ("n", "next meal", ch('n')), ("a", all, ch('a')), ("v", diet, ch('v')), ("i", info, ch('i')),
                                 ("r", "refresh", ch('r')), ("c", "config", ch('c')), ("q", "quit", ch('q'))],
             Focus::Menu => vec![("j/k", "scroll", None), ("^d/^u", "half page", None), ("g/G", "top/bottom", None),
-                                ("h", "back", ch('h')), ("a", all, ch('a')), ("i", info, ch('i')), ("q", "quit", ch('q'))],
+                                ("h", "back", ch('h')), ("a", all, ch('a')), ("v", diet, ch('v')), ("i", info, ch('i')),
+                                ("q", "quit", ch('q'))],
         };
         let mut spans = vec![Span::raw(" ")];
         let mut x = area.x + 1;
@@ -395,7 +475,10 @@ impl App {
         }
         let legend = Line::from(vec!["VG".green().bold(), " vegan  ".dim(), "V".green(), " vegetarian ".dim()]);
         f.render_widget(Line::from(spans), area);
-        f.render_widget(legend.right_aligned(), area);
+        // The legend goes on the right only if it clears the keys.
+        if x + legend.width() as u16 + 2 <= area.right() {
+            f.render_widget(legend.right_aligned(), area);
+        }
     }
 
     fn day_label(&self, d: NaiveDate) -> Line<'static> {
@@ -497,10 +580,20 @@ impl App {
 
         // ---- body: station cards, laid out in columns, scrolled as one canvas
         let mut note: Option<Line> = None;
-        let cards: Result<Vec<Station>, &str> = match self.menus.meal(&slot.meal, slot.date) {
-            None => Err(" loading…"),
-            Some(st) if st.is_empty() => Err(" No menu posted."),
+        let mut note_clickable = false;
+        let diet_name = match self.diet {
+            DietFilter::All => "",
+            DietFilter::Vegetarian => "vegetarian",
+            DietFilter::Vegan => "vegan",
+        };
+        let cards: Result<Vec<Station>, String> = match self.menus.meal(&slot.meal, slot.date) {
+            None => Err(" loading…".into()),
+            Some(st) if st.is_empty() => Err(" No menu posted.".into()),
+            Some(st) if filter_diet(st.clone(), self.diet).is_empty() => {
+                Err(format!(" Nothing {diet_name} this meal (v to change)."))
+            }
             Some(stations) => Ok({
+                let stations = filter_diet(stations, self.diet);
                 let main = main_only(&self.cfg, &stations);
                 if self.show_all {
                     main_first(&self.cfg, &stations)
@@ -518,13 +611,14 @@ impl App {
                             "a".fg(ACCENT),
                             " to show all".dim(),
                         ]));
+                        note_clickable = true;
                     }
                     main
                 }
             }),
         };
-        let canvas = cards.as_ref().ok().map(|c| self.layout_cards(c, area.width.saturating_sub(1), note, align));
-        let content_h = canvas.as_ref().map_or(1, |c| c.area.height);
+        let laid = cards.as_ref().ok().map(|c| self.layout_cards(c, area.width.saturating_sub(1), note, align));
+        let content_h = laid.as_ref().map_or(1, |(c, _, _)| c.area.height);
 
         // Centered view: if everything fits, shrink the area to the content
         // and drop it into the middle of the pane.
@@ -537,11 +631,16 @@ impl App {
         };
         let [head, body] = Layout::vertical([Constraint::Length(HEAD_H), Constraint::Fill(1)]).areas(area);
         f.render_widget(Paragraph::new(head_lines).alignment(align), head);
-        let Some(canvas) = canvas else {
+        self.body_area = body;
+        let Some((canvas, card_hits, note_rect)) = laid else {
+            self.card_hits.clear();
+            self.note_hit = None;
             let msg = cards.err().unwrap_or_default();
             f.render_widget(Paragraph::new(msg).alignment(align).dim(), body);
             return;
         };
+        self.card_hits = card_hits;
+        self.note_hit = note_rect.filter(|_| note_clickable);
         self.view_h = body.height;
         let max_scroll = content_h.saturating_sub(body.height);
         self.scroll = self.scroll.min(max_scroll);
@@ -570,16 +669,28 @@ impl App {
 
     /// Render station cards into an off-screen buffer `width` wide, masonry
     /// style (each card goes in the currently shortest column). The columns
-    /// and note are placed according to `align`.
-    fn layout_cards(&self, cards: &[Station], width: u16, note: Option<Line>, align: Alignment) -> Buffer {
+    /// and note are placed according to `align`. Also returns each card's
+    /// rect with its station family, and the note's rect, for clicks.
+    fn layout_cards(
+        &self,
+        cards: &[Station],
+        width: u16,
+        note: Option<Line>,
+        align: Alignment,
+    ) -> (Buffer, Vec<(Rect, String)>, Option<Rect>) {
         let cols = (width / CARD_MIN_W).clamp(1, 3).min(cards.len().max(1) as u16);
         let card_w = ((width - (cols - 1)) / cols).min(CARD_MAX_W).max(10);
         let used_w = cols * card_w + (cols - 1);
         let x0 = if align == Alignment::Center { width.saturating_sub(used_w) / 2 } else { 0 };
         let inner_w = (card_w - 4) as usize; // borders + 1 padding each side
 
-        let rendered: Vec<(Vec<Line>, bool)> =
-            cards.iter().map(|s| (card_lines(s, inner_w, self.details), is_main(&self.cfg, s))).collect();
+        let rendered: Vec<(Vec<Line>, bool)> = cards
+            .iter()
+            .map(|s| {
+                let details = self.details != self.flipped.contains(&family(&s.name));
+                (card_lines(&self.cfg, s, inner_w, details), is_main(&self.cfg, s))
+            })
+            .collect();
         let mut heights = vec![0u16; cols as usize];
         let mut placed = Vec::new();
         for (i, (lines, _)) in rendered.iter().enumerate() {
@@ -592,6 +703,7 @@ impl App {
         let total_h = note_y + if note.is_some() { 2 } else { 0 };
 
         let mut buf = Buffer::empty(Rect::new(0, 0, width.max(1), total_h.max(1)));
+        let hits = placed.iter().map(|&(i, r)| (r, family(&cards[i].name))).collect();
         for (i, rect) in placed {
             let (lines, main) = &rendered[i];
             let title_style = if *main { Style::new().fg(ACCENT).bold() } else { Style::new().bold() };
@@ -602,10 +714,14 @@ impl App {
                 .padding(ratatui::widgets::Padding::horizontal(1));
             Paragraph::new(lines.clone()).block(block).render(rect, &mut buf);
         }
+        let mut note_rect = None;
         if let Some(note) = note {
+            let w = (note.width() as u16).min(width);
+            let x = if align == Alignment::Center { (width - w) / 2 } else { 0 };
+            note_rect = Some(Rect::new(x, note_y + 1, w, 1));
             note.alignment(align).render(Rect::new(0, note_y + 1, width, 1), &mut buf);
         }
-        buf
+        (buf, hits, note_rect)
     }
 
     fn draw_config(&self, f: &mut Frame) {
@@ -627,10 +743,13 @@ impl App {
     }
 }
 
-/// Lines for one station card, `w` columns wide.
-fn card_lines(st: &Station, w: usize, details: bool) -> Vec<Line<'static>> {
+/// Lines for one station card, `w` columns wide. Dishes with an allergen on
+/// the config's avoid list are red, and their warning shows even without details.
+fn card_lines(cfg: &Config, st: &Station, w: usize, details: bool) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    let has_extra = |i: &Item| details && (i.desc.is_some() || !i.allergens.is_empty());
+    let warn = Style::new().fg(Color::Red).bold();
+    let has_extra =
+        |i: &Item| !avoided(cfg, i).is_empty() || details && (i.desc.is_some() || !i.allergens.is_empty());
     for (n, item) in st.items.iter().enumerate() {
         // Space out items that carry detail lines; keep plain ones compact.
         if n > 0 && (has_extra(item) || has_extra(&st.items[n - 1])) {
@@ -641,12 +760,19 @@ fn card_lines(st: &Station, w: usize, details: bool) -> Vec<Line<'static>> {
             Some(Diet::Vegetarian) => Some(Span::from("V").green()),
             None => None,
         };
+        let bad = avoided(cfg, item);
+        let badge = match (badge, bad.is_empty()) {
+            (b, true) => b,
+            (None, false) => Some(Span::styled("⚠", warn)),
+            (Some(b), false) => Some(Span::from(format!("{} ⚠", b.content)).style(b.style.patch(warn))),
+        };
         let cal = item.calories.map(|c| format!("{c} cal")).unwrap_or_default();
         let badge_w = badge.as_ref().map_or(0, |b| b.width() + 1);
         let name_w = w.saturating_sub(badge_w + cal.len() + 2).max(8);
         let name_lines = wrap(&item.name, name_w);
         for (j, text) in name_lines.iter().enumerate() {
-            let mut spans = vec![Span::raw(text.clone())];
+            let name_style = if bad.is_empty() { Style::new() } else { warn };
+            let mut spans = vec![Span::styled(text.clone(), name_style)];
             let mut used = text.chars().count();
             if j == 0 {
                 if let Some(b) = &badge {
@@ -667,8 +793,12 @@ fn card_lines(st: &Station, w: usize, details: bool) -> Vec<Line<'static>> {
             }
             if !item.allergens.is_empty() {
                 let a = format!("contains {}", item.allergens.join(", "));
-                out.extend(wrap(&a, w.saturating_sub(2)).into_iter().map(|l| Line::from(format!("  {l}")).fg(Color::Yellow).dim()));
+                let style = if bad.is_empty() { Style::new().fg(Color::Yellow).dim() } else { warn };
+                out.extend(wrap(&a, w.saturating_sub(2)).into_iter().map(|l| Line::styled(format!("  {l}"), style)));
             }
+        } else if !bad.is_empty() {
+            let a = format!("contains {}", bad.join(", "));
+            out.extend(wrap(&a, w.saturating_sub(2)).into_iter().map(|l| Line::styled(format!("  {l}"), warn)));
         }
     }
     out

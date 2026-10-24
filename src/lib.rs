@@ -22,7 +22,14 @@ pub const WEEKDAYS: [&str; 7] =
 struct RawConfig {
     source: RawSource,
     behavior: RawBehavior,
+    diet: RawDiet,
     schedule: RawSchedule,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDiet {
+    avoid: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +87,8 @@ pub struct Config {
     pub main_stations: Vec<String>,
     pub cache_ttl: Duration,
     pub cache_dir: PathBuf,
+    /// Allergens to flag, lowercase ("sesame", "shellfish", ...).
+    pub avoid: Vec<String>,
     /// Indexed Monday = 0.
     pub schedule: [Vec<Meal>; 7],
 }
@@ -121,6 +130,11 @@ impl Config {
             None => PathBuf::from(&b.cache_dir),
         };
 
+        if raw.diet.avoid.iter().any(|a| a.trim().is_empty()) {
+            return Err("diet.avoid: entries must be non-empty allergen names (use [] for none)".into());
+        }
+        let avoid = raw.diet.avoid.iter().map(|a| a.trim().to_lowercase()).collect();
+
         let s = raw.schedule;
         let days = [s.monday, s.tuesday, s.wednesday, s.thursday, s.friday, s.saturday, s.sunday];
         let mut schedule: [Vec<Meal>; 7] = Default::default();
@@ -153,6 +167,7 @@ impl Config {
             main_stations: b.main_stations,
             cache_ttl: Duration::from_secs(b.cache_ttl_minutes * 60),
             cache_dir,
+            avoid,
             schedule,
         })
     }
@@ -169,6 +184,7 @@ impl Config {
                 self.cache_ttl.as_secs() / 60,
                 self.cache_dir.display()
             ),
+            format!("  avoid={:?}", self.avoid),
         ];
         for (i, meals) in self.schedule.iter().enumerate() {
             let line = meals
@@ -363,6 +379,54 @@ impl Menus {
         out.retain(|s| !s.items.is_empty());
         Some(out)
     }
+}
+
+/// The item's allergens that are on the config's avoid list. Matches whole
+/// words, ignoring plurals: "nut" flags "tree nuts", "peanut" flags "peanuts".
+pub fn avoided<'a>(cfg: &Config, item: &'a Item) -> Vec<&'a str> {
+    fn words(s: &str) -> Vec<String> {
+        s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(|w| w.trim_end_matches('s').to_string()).collect()
+    }
+    item.allergens
+        .iter()
+        .filter(|a| {
+            let a = words(a);
+            cfg.avoid.iter().any(|v| {
+                let v = words(v);
+                !v.is_empty() && a.windows(v.len()).any(|w| w == v.as_slice())
+            })
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DietFilter {
+    All,
+    Vegetarian,
+    Vegan,
+}
+
+impl DietFilter {
+    pub fn allows(self, item: &Item) -> bool {
+        match self {
+            DietFilter::All => true,
+            DietFilter::Vegetarian => item.diet.is_some(),
+            DietFilter::Vegan => item.diet == Some(Diet::Vegan),
+        }
+    }
+}
+
+/// Stations with only the items the filter allows; stations left empty are dropped.
+pub fn filter_diet(stations: Vec<Station>, f: DietFilter) -> Vec<Station> {
+    stations
+        .into_iter()
+        .map(|mut s| {
+            s.items.retain(|i| f.allows(i));
+            s
+        })
+        .filter(|s| !s.items.is_empty())
+        .collect()
 }
 
 pub fn is_main(cfg: &Config, station: &Station) -> bool {

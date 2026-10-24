@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Days, NaiveDate, NaiveTime};
 use chrono_tz::Tz;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use hotchkiss_menu::*;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -17,7 +17,10 @@ Examples:
   hotchkissmenu -d sunday -m brunch  Sunday brunch
   hotchkissmenu -t 6pm               the meal at/after 6pm today
   hotchkissmenu -d 10/30 -t noon     the meal at/after noon on Oct 30
-  hotchkissmenu -m dinner            the next dinner";
+  hotchkissmenu -m dinner            the next dinner
+  hotchkissmenu --diet vegan         only vegan dishes
+  hotchkissmenu --line               one line, for a status bar (tmux, SketchyBar)
+  hotchkissmenu --json -n 3          machine-readable next three meals";
 
 #[derive(Parser)]
 #[command(
@@ -44,12 +47,37 @@ struct Args {
     /// Show descriptions and allergens
     #[arg(short, long)]
     info: bool,
+    /// Only show dishes for this diet
+    #[arg(long, value_enum)]
+    diet: Option<DietArg>,
+    /// Print one line per meal (status bars): meal, time, a few dishes
+    #[arg(long, conflicts_with = "json")]
+    line: bool,
+    /// Print the meals as JSON
+    #[arg(long)]
+    json: bool,
     /// Ignore the cache and re-download menus
     #[arg(short, long)]
     refresh: bool,
     /// Config file [default: ~/.config/hotchkiss-menu/config.toml]
     #[arg(short, long)]
     config: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DietArg {
+    Vegetarian,
+    Vegan,
+}
+
+impl Args {
+    fn diet(&self) -> DietFilter {
+        match self.diet {
+            None => DietFilter::All,
+            Some(DietArg::Vegetarian) => DietFilter::Vegetarian,
+            Some(DietArg::Vegan) => DietFilter::Vegan,
+        }
+    }
 }
 
 struct Style {
@@ -66,6 +94,7 @@ impl Style {
     fn yellow(&self, s: &str) -> String { Self::sgr(self.out, "33", s) }
     fn dim(&self, s: &str) -> String { Self::sgr(self.out, "2", s) }
     fn green(&self, s: &str) -> String { Self::sgr(self.out, "32", s) }
+    fn red(&self, s: &str) -> String { Self::sgr(self.out, "1;31", s) }
     fn italic_dim(&self, s: &str) -> String { Self::sgr(self.out, "2;3", s) }
     fn err_dim(&self, s: &str) -> String { Self::sgr(self.err, "2", s) }
     fn err_yellow(&self, s: &str) -> String { Self::sgr(self.err, "33", s) }
@@ -109,13 +138,12 @@ fn run(st: &Style) -> Result<(), String> {
         warn(ensure(&cfg, &mut menus, &keys_for([d], &types), args.refresh)?);
         warn_unscheduled(&cfg, &menus, d, st);
         let meals: Vec<&Meal> = cfg.meals_on(d).iter().filter(|m| matches_meal(m, meal_q)).collect();
-        if meals.is_empty() {
+        if meals.is_empty() && !args.json {
             let what = meal_q.map_or("no meals".to_string(), |q| format!("no {q:?} meal"));
             println!("{what} scheduled on {} (per config)", d.format("%A %b %-d"));
         }
-        for m in meals {
-            render(&cfg, &menus, m, d, now, &args, st);
-        }
+        let found: Vec<(&Meal, NaiveDate)> = meals.into_iter().map(|m| (m, d)).collect();
+        output(&cfg, &menus, &found, now, &args, st);
         return Ok(());
     }
 
@@ -149,10 +177,103 @@ fn run(st: &Style) -> Result<(), String> {
             from.format("%a %b %-d %-I:%M %p")
         ));
     }
-    for (m, d) in found {
-        render(&cfg, &menus, m, d, now, &args, st);
-    }
+    output(&cfg, &menus, &found, now, &args, st);
     Ok(())
+}
+
+fn output(cfg: &Config, menus: &Menus, found: &[(&Meal, NaiveDate)], now: DateTime<Tz>, args: &Args, st: &Style) {
+    if args.json {
+        let meals: Vec<_> = found.iter().map(|&(m, d)| to_json(cfg, menus, m, d, now, args)).collect();
+        println!("{}", serde_json::to_string_pretty(&meals).unwrap());
+    } else if args.line {
+        for &(m, d) in found {
+            println!("{}", one_line(cfg, menus, m, d, now, args));
+        }
+    } else {
+        for &(m, d) in found {
+            render(cfg, menus, m, d, now, args, st);
+        }
+    }
+}
+
+/// What a meal shows given -a and --diet: (shown, all after the diet filter,
+/// whether there was no main station so every station is shown).
+fn pick(cfg: &Config, menus: &Menus, meal: &Meal, d: NaiveDate, args: &Args) -> (Vec<Station>, Vec<Station>, bool) {
+    let stations = filter_diet(menus.meal(meal, d).unwrap_or_default(), args.diet());
+    if args.all {
+        return (main_first(cfg, &stations), stations, false);
+    }
+    let main = main_only(cfg, &stations);
+    if main.is_empty() { (stations.clone(), stations, true) } else { (main, stations, false) }
+}
+
+fn status_text(cfg: &Config, meal: &Meal, d: NaiveDate, now: DateTime<Tz>) -> (&'static str, Option<i64>) {
+    match timing(cfg, meal, d, now) {
+        Timing::Now { left_secs } => ("now", Some(left_secs)),
+        Timing::Upcoming { in_secs } => ("upcoming", Some(in_secs)),
+        Timing::Over => ("over", None),
+    }
+}
+
+/// "Dinner 5:30 PM · 16m left · Baked Chicken; Honey Carrots +4" (";" since dish names can contain commas)
+fn one_line(cfg: &Config, menus: &Menus, meal: &Meal, d: NaiveDate, now: DateTime<Tz>, args: &Args) -> String {
+    const SHOW: usize = 2;
+    let when = match status_text(cfg, meal, d, now) {
+        ("now", Some(s)) => format!("{} left", fmt_duration(s)),
+        ("upcoming", Some(s)) => format!("in {}", fmt_duration(s)),
+        _ => "ended".into(),
+    };
+    let mut head = format!("{} {}", meal.label, fmt_time(meal.start));
+    if d != now.date_naive() {
+        head = format!("{} {head}", d.format("%a"));
+    }
+    let (shown, _, _) = pick(cfg, menus, meal, d, args);
+    let items: Vec<&Item> = shown.iter().flat_map(|s| &s.items).collect();
+    if items.is_empty() {
+        return format!("{head} · {when} · no menu posted");
+    }
+    let names: Vec<String> = items
+        .iter()
+        .take(SHOW)
+        .map(|i| if avoided(cfg, i).is_empty() { i.name.clone() } else { format!("{} ⚠", i.name) })
+        .collect();
+    let more = if items.len() > SHOW { format!(" +{}", items.len() - SHOW) } else { String::new() };
+    format!("{head} · {when} · {}{more}", names.join("; "))
+}
+
+fn to_json(cfg: &Config, menus: &Menus, meal: &Meal, d: NaiveDate, now: DateTime<Tz>, args: &Args) -> serde_json::Value {
+    let (status, secs) = status_text(cfg, meal, d, now);
+    let (shown, all, _) = pick(cfg, menus, meal, d, args);
+    let stations: Vec<_> = shown
+        .iter()
+        .map(|s| {
+            let items: Vec<_> = s
+                .items
+                .iter()
+                .map(|i| {
+                    serde_json::json!({
+                        "name": i.name,
+                        "description": i.desc,
+                        "diet": i.diet.map(|d| match d { Diet::Vegan => "vegan", Diet::Vegetarian => "vegetarian" }),
+                        "calories": i.calories,
+                        "allergens": i.allergens,
+                        "avoid": avoided(cfg, i),
+                    })
+                })
+                .collect();
+            serde_json::json!({ "name": s.name, "main": is_main(cfg, s), "items": items })
+        })
+        .collect();
+    serde_json::json!({
+        "meal": meal.label,
+        "date": d.to_string(),
+        "start": meal.start.format("%H:%M").to_string(),
+        "end": meal.end.format("%H:%M").to_string(),
+        "status": status,
+        "seconds": secs,
+        "stations": stations,
+        "hidden_stations": all.len() - shown.len(),
+    })
 }
 
 fn render(cfg: &Config, menus: &Menus, meal: &Meal, d: NaiveDate, now: DateTime<Tz>, args: &Args, st: &Style) {
@@ -169,15 +290,18 @@ fn render(cfg: &Config, menus: &Menus, meal: &Meal, d: NaiveDate, now: DateTime<
         fmt_time(meal.end)
     );
 
-    let stations = menus.meal(meal, d).unwrap_or_default();
+    let (shown, stations, fell_back) = pick(cfg, menus, meal, d, args);
     if stations.is_empty() {
-        println!("  (no menu posted)\n");
+        let what = if menus.meal(meal, d).unwrap_or_default().is_empty() {
+            "no menu posted"
+        } else {
+            "nothing matching --diet"
+        };
+        println!("  ({what})\n");
         return;
     }
-    let mut shown = if args.all { main_first(cfg, &stations) } else { main_only(cfg, &stations) };
-    if shown.is_empty() {
+    if fell_back {
         println!("  {}", st.dim(&format!("(no {} this meal; showing every station)", cfg.main_stations.join(" / "))));
-        shown = stations.clone();
     }
     for s in &shown {
         println!("  {}", st.bold(&s.name));
@@ -188,7 +312,15 @@ fn render(cfg: &Config, menus: &Menus, meal: &Meal, d: NaiveDate, now: DateTime<
                 None => String::new(),
             };
             let cal = item.calories.map_or(String::new(), |c| format!("  {}", st.dim(&format!("{c} cal"))));
-            println!("    • {}{badge}{cal}", item.name);
+            let bad = avoided(cfg, item);
+            if bad.is_empty() {
+                println!("    • {}{badge}{cal}", item.name);
+            } else {
+                println!("    • {}{badge}{cal}", st.red(&format!("{} ⚠", item.name)));
+                if !args.info {
+                    println!("      {}", st.red(&format!("contains {}", bad.join(", "))));
+                }
+            }
             if args.info {
                 if let Some(desc) = &item.desc {
                     println!("      {}", st.italic_dim(desc));

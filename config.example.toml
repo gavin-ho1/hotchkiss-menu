@@ -20,6 +20,12 @@ main_stations = ["Chef's Table", "Wakin' Up"]
 cache_ttl_minutes = 30
 cache_dir = "~/.cache/hotchkiss-menu"
 
+[diet]
+# Allergens to flag in red on every menu, e.g. ["sesame", "shellfish"].
+# Matches Nutrislice's allergen tags (seen so far: milk, egg, gluten, wheat,
+# soy, sesame, fish, shellfish). Use [] for none.
+avoid = []
+
 # Meal schedule per weekday.
 #   label = what gets printed (and what -m matches)
 #   menus = Nutrislice menu types merged into this meal
