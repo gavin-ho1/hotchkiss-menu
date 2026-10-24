@@ -1,0 +1,66 @@
+# Hotchkiss dining hall config, shared by `hotchkissmenu` (CLI) and
+# `hotchkissdininghall` / `dh` / `dininghall` (TUI).
+# This file is the single source of truth: every key is required and
+# unknown keys are rejected.
+
+[source]
+base_url = "https://hotchkiss.api.nutrislice.com/menu/api"
+school = "dining-hall"
+timezone = "America/New_York"
+
+[behavior]
+# Days ahead to search for the "next" meal (covers breaks / long weekends).
+lookahead_days = 14
+# Stations shown by default ("the main food"). A station and its numbered
+# copies ("Chef's Table 2") count as one; only the first is shown.
+# Pass -a (CLI) or press `a` (TUI) to see every station.
+main_stations = ["Chef's Table", "Wakin' Up"]
+# Menus are cached on disk; a cached week younger than this is used without
+# hitting the network. The TUI always shows the cache first, then refreshes.
+cache_ttl_minutes = 30
+cache_dir = "~/.cache/hotchkiss-menu"
+
+# Meal schedule per weekday.
+#   label = what gets printed (and what -m matches)
+#   menus = Nutrislice menu types merged into this meal
+#           (available: breakfast, lunch, dinner, brunch, snack-bar)
+#   start / end = 24h "HH:MM"
+#
+# NOTE: Nutrislice does not publish meal times; these are GUESSES. Fix them.
+# Sunday: Nutrislice splits brunch across breakfast (fruit/bakery), brunch
+# (hot food) and lunch (soups), so all three are merged into one Brunch.
+[schedule]
+monday = [
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "08:15" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+]
+tuesday = [
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "08:15" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+]
+wednesday = [
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "08:15" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+]
+thursday = [
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "08:15" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+]
+friday = [
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "08:15" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+]
+saturday = [
+  { label = "Breakfast", menus = ["breakfast"], start = "07:30", end = "09:00" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+]
+sunday = [
+  { label = "Brunch",    menus = ["brunch", "breakfast", "lunch"], start = "10:00", end = "13:00" },
+  { label = "Dinner",    menus = ["dinner"],                       start = "17:30", end = "19:00" },
+]
