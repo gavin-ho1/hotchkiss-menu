@@ -10,8 +10,14 @@ use hotchkiss_menu::*;
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout, Rect},
+    crossterm::{
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+            MouseButton, MouseEvent, MouseEventKind,
+        },
+        execute,
+    },
+    layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
@@ -23,7 +29,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-const ACCENT: Color = Color::Cyan;
+// Hotchkiss blue and white. Navy is only used as a background (it vanishes as
+// text on a dark terminal); ACCENT is a lighter tint of it for text and borders.
+const NAVY: Color = Color::Rgb(0x0F, 0x2B, 0x5B);
+const WHITE: Color = Color::Rgb(0xFF, 0xFF, 0xFF);
+const ACCENT: Color = Color::Rgb(0x7F, 0xA6, 0xE0);
+const MUTED: Color = Color::Rgb(0x2A, 0x36, 0x4C);
 const CARD_MAX_W: u16 = 64;
 const CARD_MIN_W: u16 = 38;
 
@@ -61,7 +72,13 @@ struct App {
     errors: Vec<String>,
     show_config: bool,
     quit: bool,
-    tx: mpsc::Sender<(WeekKey, Result<Week, String>)>,
+    // Hit-testing state for mouse clicks, refreshed on every draw.
+    list_area: Rect,
+    list_offset: usize,
+    list_rows: Vec<Option<usize>>,
+    menu_area: Rect,
+    help_hits: Vec<(Rect, KeyCode)>,
+    tx:mpsc::Sender<(WeekKey, Result<Week, String>)>,
     rx: mpsc::Receiver<(WeekKey, Result<Week, String>)>,
 }
 
@@ -86,7 +103,9 @@ fn main() {
 
     let mut app = App::new(Arc::new(cfg));
     let mut terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let res = app.run(&mut terminal);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     if let Err(e) = res {
         eprintln!("error: {e}");
@@ -123,7 +142,8 @@ impl App {
         let mut app = App {
             cfg, today, slots, sel: 0, user_moved: false, menus, keys, focus: Focus::List,
             show_all: false, details: true, scroll: 0, view_h: 0, pending: 0, errors: Vec::new(),
-            show_config: false, quit: false, tx, rx,
+            show_config: false, quit: false, list_area: Rect::default(), list_offset: 0, list_rows: Vec::new(),
+            menu_area: Rect::default(), help_hits: Vec::new(), tx, rx,
         };
         app.sel = app.next_meal();
         app.fetch(stale);
@@ -145,10 +165,10 @@ impl App {
         while !self.quit {
             terminal.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(250))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press {
-                        self.key(k);
-                    }
+                match event::read()? {
+                    Event::Key(k) if k.kind == KeyEventKind::Press => self.key(k),
+                    Event::Mouse(m) => self.mouse(m),
+                    _ => {}
                 }
             }
             while let Ok((k, res)) = self.rx.try_recv() {
@@ -181,6 +201,23 @@ impl App {
             .iter()
             .position(|s| self.cfg.at(s.date, s.meal.end) > now && !matches!(self.state(s), Loaded::Empty))
             .unwrap_or(0)
+    }
+
+    /// The meal to open when a day heading is clicked: the first one that
+    /// hasn't ended (so today lands on the current or next meal), or the
+    /// day's last meal if they're all over.
+    fn day_pick(&self, date: NaiveDate) -> Option<usize> {
+        let now = self.cfg.now();
+        let mut day = (0..self.slots.len()).filter(|&i| self.slots[i].date == date).peekable();
+        let first = *day.peek()?;
+        let mut last = first;
+        for i in day {
+            if self.cfg.at(date, self.slots[i].meal.end) > now {
+                return Some(i);
+            }
+            last = i;
+        }
+        Some(last)
     }
 
     fn select(&mut self, i: usize) {
@@ -264,6 +301,40 @@ impl App {
         }
     }
 
+    /// Click a meal (or day heading) to select it, click the menu to focus it,
+    /// click a help-bar key to run it; the wheel scrolls whichever pane it's over.
+    fn mouse(&mut self, m: MouseEvent) {
+        let pos = Position::new(m.column, m.row);
+        if self.show_config {
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.show_config = false;
+            }
+            return;
+        }
+        let in_list = self.list_area.contains(pos);
+        let in_menu = self.menu_area.contains(pos);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) if in_list => {
+                let row = self.list_offset + (m.row - self.list_area.y) as usize;
+                if let Some(&Some(i)) = self.list_rows.get(row) {
+                    self.select(i);
+                }
+                self.focus = Focus::List;
+            }
+            MouseEventKind::Down(MouseButton::Left) if in_menu => self.focus = Focus::Menu,
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(&(_, code)) = self.help_hits.iter().find(|(r, _)| r.contains(pos)) {
+                    self.key(KeyEvent::new(code, KeyModifiers::NONE));
+                }
+            }
+            MouseEventKind::ScrollDown if in_list => self.select(self.sel + 1),
+            MouseEventKind::ScrollUp if in_list => self.select(self.sel.saturating_sub(1)),
+            MouseEventKind::ScrollDown if in_menu => self.scroll = self.scroll.saturating_add(3),
+            MouseEventKind::ScrollUp if in_menu => self.scroll = self.scroll.saturating_sub(3),
+            _ => {}
+        }
+    }
+
     // ------------------------------------------------------------- drawing
 
     fn draw(&mut self, f: &mut Frame) {
@@ -274,7 +345,7 @@ impl App {
         let now = self.cfg.now();
         f.render_widget(
             Line::from(vec![
-                " Hotchkiss Dining Hall ".bold().fg(Color::Black).bg(ACCENT),
+                " Hotchkiss Dining Hall ".bold().fg(WHITE).bg(NAVY),
                 format!("  {}", now.format("%A, %b %-d · %-I:%M %p")).dim(),
             ]),
             top,
@@ -296,19 +367,31 @@ impl App {
         }
     }
 
-    fn draw_help(&self, f: &mut Frame, area: Rect) {
+    fn draw_help(&mut self, f: &mut Frame, area: Rect) {
         let all = if self.show_all { "main only" } else { "all stations" };
         let info = if self.details { "hide details" } else { "details" };
-        let keys: Vec<(&str, &str)> = match self.focus {
-            Focus::List => vec![("j/k", "meal"), ("l", "open"), ("[ ]", "day"), ("n", "next meal"), ("a", all),
-                                ("i", info), ("r", "refresh"), ("c", "config"), ("q", "quit")],
-            Focus::Menu => vec![("j/k", "scroll"), ("^d/^u", "half page"), ("g/G", "top/bottom"), ("h", "back"),
-                                ("a", all), ("i", info), ("q", "quit")],
+        let ch = |c| Some(KeyCode::Char(c));
+        // The key code, if any, is what clicking the entry sends.
+        let keys: Vec<(&str, &str, Option<KeyCode>)> = match self.focus {
+            Focus::List => vec![("j/k", "meal", None), ("l", "open", ch('l')), ("[ ]", "day", None),
+                                ("n", "next meal", ch('n')), ("a", all, ch('a')), ("i", info, ch('i')),
+                                ("r", "refresh", ch('r')), ("c", "config", ch('c')), ("q", "quit", ch('q'))],
+            Focus::Menu => vec![("j/k", "scroll", None), ("^d/^u", "half page", None), ("g/G", "top/bottom", None),
+                                ("h", "back", ch('h')), ("a", all, ch('a')), ("i", info, ch('i')), ("q", "quit", ch('q'))],
         };
         let mut spans = vec![Span::raw(" ")];
-        for (k, what) in keys {
+        let mut x = area.x + 1;
+        self.help_hits.clear();
+        for (k, what, code) in keys {
+            let label = format!(" {what}   ");
+            let w = (k.chars().count() + label.chars().count()) as u16;
+            if let Some(code) = code {
+                // Exclude the trailing gap from the clickable width.
+                self.help_hits.push((Rect::new(x, area.y, w - 3, 1).intersection(area), code));
+            }
+            x += w;
             spans.push(Span::from(k).fg(ACCENT));
-            spans.push(Span::from(format!(" {what}   ")).dim());
+            spans.push(Span::from(label).dim());
         }
         let legend = Line::from(vec!["VG".green().bold(), " vegan  ".dim(), "V".green(), " vegetarian ".dim()]);
         f.render_widget(Line::from(spans), area);
@@ -324,16 +407,20 @@ impl App {
         }
     }
 
-    fn draw_list(&self, f: &mut Frame, area: Rect, now: DateTime<Tz>) {
+    fn draw_list(&mut self, f: &mut Frame, area: Rect, now: DateTime<Tz>) {
         let focused = self.focus == Focus::List;
         let mut items = Vec::new();
+        // Slot each list row selects when clicked (see `day_pick` for day headings).
+        let mut rows = Vec::new();
         let mut sel_row = 0;
         for (i, slot) in self.slots.iter().enumerate() {
             if i == 0 || slot.date != self.slots[i - 1].date {
                 if i > 0 {
                     items.push(ListItem::new(""));
+                    rows.push(None);
                 }
                 items.push(ListItem::new(self.day_label(slot.date)));
+                rows.push(self.day_pick(slot.date));
             }
             let (marker, style) = match (self.state(slot), timing(&self.cfg, &slot.meal, slot.date, now)) {
                 (Loaded::Loading, _) => (" …", Style::new().dim()),
@@ -349,11 +436,12 @@ impl App {
                 Span::styled(format!(" {:<10}{:>7}", slot.meal.label, short_time(slot.meal.start)), style),
                 Span::styled(marker, style.remove_modifier(Modifier::DIM)),
             ])));
+            rows.push(Some(i));
         }
         let highlight = if focused {
-            Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+            Style::new().fg(WHITE).bg(NAVY).add_modifier(Modifier::BOLD)
         } else {
-            Style::new().bg(Color::DarkGray)
+            Style::new().bg(MUTED)
         };
         let list = List::new(items)
             .block(
@@ -364,19 +452,23 @@ impl App {
             .highlight_style(highlight);
         let mut state = ListState::default().with_selected(Some(sel_row));
         f.render_stateful_widget(list, area, &mut state);
+        self.list_area = area;
+        self.list_offset = state.offset();
+        self.list_rows = rows;
     }
 
     fn draw_menu(&mut self, f: &mut Frame, area: Rect, now: DateTime<Tz>) {
+        self.menu_area = area;
+        // With only the main stations showing, center the menu in its pane.
+        let align = if self.show_all { Alignment::Left } else { Alignment::Center };
         let area = area.inner(ratatui::layout::Margin { horizontal: 2, vertical: 0 });
         let Some(slot) = self.slots.get(self.sel) else {
             f.render_widget(Paragraph::new("No meals scheduled in the lookahead window (see config)."), area);
             return;
         };
-        let [head, body] = Layout::vertical([Constraint::Length(4), Constraint::Fill(1)]).areas(area);
-
         // ---- header: meal, date/time, status (+ progress bar while serving)
         let focused = self.focus == Focus::Menu;
-        let title_style = if focused { Style::new().fg(Color::Black).bg(ACCENT) } else { Style::new().fg(ACCENT) };
+        let title_style = if focused { Style::new().fg(WHITE).bg(NAVY) } else { Style::new().fg(ACCENT) };
         let mut head_lines = vec![
             Line::from(""),
             Line::from(vec![
@@ -402,20 +494,13 @@ impl App {
             Timing::Upcoming { in_secs } => Line::from(format!(" starts in {}", fmt_duration(in_secs))).fg(Color::Yellow),
             Timing::Over => Line::from(" ended").dim(),
         });
-        f.render_widget(Paragraph::new(head_lines), head);
 
         // ---- body: station cards, laid out in columns, scrolled as one canvas
         let mut note: Option<Line> = None;
-        let cards: Vec<Station> = match self.menus.meal(&slot.meal, slot.date) {
-            None => {
-                f.render_widget(Paragraph::new(" loading…").dim(), body);
-                return;
-            }
-            Some(st) if st.is_empty() => {
-                f.render_widget(Paragraph::new(" No menu posted.").dim(), body);
-                return;
-            }
-            Some(stations) => {
+        let cards: Result<Vec<Station>, &str> = match self.menus.meal(&slot.meal, slot.date) {
+            None => Err(" loading…"),
+            Some(st) if st.is_empty() => Err(" No menu posted."),
+            Some(stations) => Ok({
                 let main = main_only(&self.cfg, &stations);
                 if self.show_all {
                     main_first(&self.cfg, &stations)
@@ -436,11 +521,27 @@ impl App {
                     }
                     main
                 }
-            }
+            }),
         };
+        let canvas = cards.as_ref().ok().map(|c| self.layout_cards(c, area.width.saturating_sub(1), note, align));
+        let content_h = canvas.as_ref().map_or(1, |c| c.area.height);
 
-        let canvas = self.layout_cards(&cards, body.width.saturating_sub(1), note);
-        let content_h = canvas.area.height;
+        // Centered view: if everything fits, shrink the area to the content
+        // and drop it into the middle of the pane.
+        const HEAD_H: u16 = 4;
+        let area = if align == Alignment::Center && HEAD_H + content_h < area.height {
+            let h = HEAD_H + content_h;
+            Rect { y: area.y + (area.height - h) / 2, height: h, ..area }
+        } else {
+            area
+        };
+        let [head, body] = Layout::vertical([Constraint::Length(HEAD_H), Constraint::Fill(1)]).areas(area);
+        f.render_widget(Paragraph::new(head_lines).alignment(align), head);
+        let Some(canvas) = canvas else {
+            let msg = cards.err().unwrap_or_default();
+            f.render_widget(Paragraph::new(msg).alignment(align).dim(), body);
+            return;
+        };
         self.view_h = body.height;
         let max_scroll = content_h.saturating_sub(body.height);
         self.scroll = self.scroll.min(max_scroll);
@@ -468,10 +569,13 @@ impl App {
     }
 
     /// Render station cards into an off-screen buffer `width` wide, masonry
-    /// style (each card goes in the currently shortest column).
-    fn layout_cards(&self, cards: &[Station], width: u16, note: Option<Line>) -> Buffer {
+    /// style (each card goes in the currently shortest column). The columns
+    /// and note are placed according to `align`.
+    fn layout_cards(&self, cards: &[Station], width: u16, note: Option<Line>, align: Alignment) -> Buffer {
         let cols = (width / CARD_MIN_W).clamp(1, 3).min(cards.len().max(1) as u16);
         let card_w = ((width - (cols - 1)) / cols).min(CARD_MAX_W).max(10);
+        let used_w = cols * card_w + (cols - 1);
+        let x0 = if align == Alignment::Center { width.saturating_sub(used_w) / 2 } else { 0 };
         let inner_w = (card_w - 4) as usize; // borders + 1 padding each side
 
         let rendered: Vec<(Vec<Line>, bool)> =
@@ -481,7 +585,7 @@ impl App {
         for (i, (lines, _)) in rendered.iter().enumerate() {
             let col = (0..cols as usize).min_by_key(|&c| heights[c]).unwrap();
             let h = lines.len() as u16 + 2;
-            placed.push((i, Rect::new(col as u16 * (card_w + 1), heights[col], card_w, h)));
+            placed.push((i, Rect::new(x0 + col as u16 * (card_w + 1), heights[col], card_w, h)));
             heights[col] += h;
         }
         let note_y = heights.iter().copied().max().unwrap_or(0);
@@ -499,7 +603,7 @@ impl App {
             Paragraph::new(lines.clone()).block(block).render(rect, &mut buf);
         }
         if let Some(note) = note {
-            note.render(Rect::new(0, note_y + 1, width, 1), &mut buf);
+            note.alignment(align).render(Rect::new(0, note_y + 1, width, 1), &mut buf);
         }
         buf
     }

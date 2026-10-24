@@ -42,6 +42,9 @@ Meals are listed on the left, and the selected meal's menu is on the right.
 | `i` | toggle descriptions + allergens | toggle descriptions + allergens |
 | `r` / `c` / `q` | refresh / config / quit | refresh / config / quit |
 
+The mouse works too: click a meal or day to open it, click the menu to focus
+it, scroll with the wheel, and click any key in the bottom bar to run it.
+
 **VG** = vegan, **V** = vegetarian.
 
 ## CLI
