@@ -32,41 +32,41 @@ avoid = []
 #           (available: breakfast, lunch, dinner, brunch, snack-bar)
 #   start / end = 24h "HH:MM"
 #
-# NOTE: Nutrislice does not publish meal times; these are GUESSES. Fix them.
+# Times are the posted Dining Hall Hours (Nutrislice doesn't publish them).
 # Sunday: Nutrislice splits brunch across breakfast (fruit/bakery), brunch
 # (hot food) and lunch (soups), so all three are merged into one Brunch.
 [schedule]
 monday = [
-  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "08:15" },
-  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
-  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "09:00" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "14:00" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:00", end = "19:30" },
 ]
 tuesday = [
-  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "08:15" },
-  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
-  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "09:00" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "14:00" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:00", end = "19:30" },
 ]
 wednesday = [
-  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "08:15" },
-  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
-  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "09:00" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:30" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:00", end = "19:30" },
 ]
 thursday = [
-  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "08:15" },
-  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
-  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "09:00" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "14:00" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:00", end = "19:30" },
 ]
 friday = [
-  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "08:15" },
-  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
-  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "09:00" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "14:00" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:00", end = "19:30" },
 ]
 saturday = [
-  { label = "Breakfast", menus = ["breakfast"], start = "07:30", end = "09:00" },
-  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:15" },
-  { label = "Dinner",    menus = ["dinner"],    start = "17:30", end = "19:00" },
+  { label = "Breakfast", menus = ["breakfast"], start = "07:00", end = "09:00" },
+  { label = "Lunch",     menus = ["lunch"],     start = "11:30", end = "13:30" },
+  { label = "Dinner",    menus = ["dinner"],    start = "17:00", end = "19:30" },
 ]
 sunday = [
-  { label = "Brunch",    menus = ["brunch", "breakfast", "lunch"], start = "10:00", end = "13:00" },
-  { label = "Dinner",    menus = ["dinner"],                       start = "17:30", end = "19:00" },
+  { label = "Brunch",    menus = ["brunch", "breakfast", "lunch"], start = "09:30", end = "12:30" },
+  { label = "Dinner",    menus = ["dinner"],                       start = "17:00", end = "19:00" },
 ]
